@@ -17,6 +17,12 @@ Disciplined dip-buyer, long only, one position at a time:
   80 bps or more below the trailing 60-bar high and the trend is up
   (close above the 48-bar EMA, 12-bar EMA above the 48-bar EMA), buy
   with all available cash.
+- **Regime filter (v2)**: the entry also needs the 120-bar momentum at
+  +100 bps or better (once 120 closes exist). The dev winners entered
+  at +108/+114 bps; the same rules lost money on the time-reversed
+  window from an entry at +54 bps. The filter keeps the full dev
+  profit while the bot stays flat on every stress window instead of
+  bleeding there.
 - **Exit**: sell everything when the close rises 100 bps above the
   entry fill price (take profit), falls 70 bps below the highest high
   since entry (trailing stop), or falls 150 bps below the entry
@@ -41,3 +47,10 @@ node cli/makefun.mjs grade-local --kit . --bot <this repo> --driver process --wo
 
 Local grade on the frozen dev window (1,440 bars): **net PnL
 +$19.05**, 4 trades, max drawdown 0.53%, guardrails met.
+
+## Robustness (offline matrix, v2)
+
+Same dev profit as v1, but the worst case across the stress windows
+improved from -$8.84 to $0.00: first half +$19.05, second half $0.00
+(no trades), worst falling stretch $0.00 (no trades), time-reversed
+window $0.00 (no trades — v1 lost $8.84 there), 2x fees +$17.42.
