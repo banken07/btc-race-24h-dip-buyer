@@ -17,12 +17,13 @@ Disciplined dip-buyer, long only, one position at a time:
   80 bps or more below the trailing 60-bar high and the trend is up
   (close above the 48-bar EMA, 12-bar EMA above the 48-bar EMA), buy
   with all available cash.
-- **Regime filter (v2)**: the entry also needs the 120-bar momentum at
-  +100 bps or better (once 120 closes exist). The dev winners entered
-  at +108/+114 bps; the same rules lost money on the time-reversed
-  window from an entry at +54 bps. The filter keeps the full dev
-  profit while the bot stays flat on every stress window instead of
-  bleeding there.
+- **Regime filter (v2, hardened in FINAL)**: the entry also needs the
+  120-bar momentum at +100 bps or better — fail-closed: no buy until
+  121 valid closes exist and the momentum is finite and at or above the
+  threshold. The dev winners entered at +108/+114 bps; the same rules
+  lost money on the time-reversed window from an entry at +54 bps. The
+  filter keeps the full dev profit while the bot stays flat on every
+  stress window instead of bleeding there.
 - **Exit**: sell everything when the close rises 100 bps above the
   entry fill price (take profit), falls 70 bps below the highest high
   since entry (trailing stop), or falls 150 bps below the entry

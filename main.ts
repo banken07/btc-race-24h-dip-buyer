@@ -1,38 +1,41 @@
-// Dip-buyer v2 for the cbBTC 24h race (agent-fun/bars-replay/v1).
+// Dip-buyer FINAL for the cbBTC 24h race (agent-fun/bars-replay/v1).
 //
-// v2 adds ONE thing to the v1 dip-buyer: a regime filter. v1 bought every
-// 80 bps pullback inside an EMA uptrend and made +$19.05 on the dev window,
-// but the same rules lost -$8.84 on the time-reversed window: one entry
-// fired while the two-hour trend was only weakly up, and the trade bled.
-// The two dev winners both entered with the 120-bar return above +100 bps;
-// the reversed loser entered at +54 bps. v2 therefore demands the same
-// pullback AND a clearly rising two-hour trend before it buys. On the
-// offline matrix v2 keeps the full dev profit and stays flat on every
-// stress window instead of bleeding. Matrix (offline evaluator, exact
-// harness fill model, calibrated to grade-local to the cent):
-//   full dev +$19.05 (v1: +$19.05) | half1 +$19.05 | half2 $0.00 |
-//   worst falling stretch $0.00 | time-reversed $0.00 (v1: -$8.84) |
-//   2x fees +$17.42. Worst case $0.00 vs v1's -$8.84, dev unchanged.
+// Strategy (frozen from v2, unchanged parameters): buy an 80 bps pullback
+// below the trailing 60-bar high while the trend is up (close above the
+// 48-bar EMA, 12-bar EMA above the 48-bar EMA) AND the 120-bar momentum
+// is at least +100 bps; sell everything at +100 bps take profit, at
+// -70 bps below the highest high since entry (trailing stop), or at
+// -150 bps below the entry (hard stop); then wait 5 bars. One position
+// at a time, full available cash per buy, 150 bps max-slippage cap.
+//
+// FINAL fixes vs v2 (all three close real loopholes; none changes the
+// dev result — verified: the offline matrix reproduces v2's numbers on
+// every scenario, and grade-local confirms +$19.05 on the dev window):
+//  1. Momentum is FAIL-CLOSED. v2 treated "not enough history" as a
+//     pass (mom === null || mom >= 100), so the bot could buy during
+//     warmup before any momentum existed. Now a buy needs 121 valid
+//     closes and a finite momentum at or above +100 bps; anything less
+//     is NO TRADE.
+//  2. Trailing high is EXACTLY the 60 completed closes before the
+//     decision close. v2 scanned 61 closes including the decision
+//     candle itself. The backtest uses the same window, so the matrix
+//     and the bot can no longer disagree by one candle.
+//  3. Data validation before any state update. A close that is not a
+//     finite positive number is skipped whole: it never enters the
+//     close history and never feeds an EMA, so one bad bar cannot
+//     poison every indicator after it. A batch with no CBBTC bar still
+//     gets its one protocol reply, with empty orders. Warmup is gated
+//     on the batch sequence (hello.warmup_bars, the protocol's own
+//     definition: no trading on seq < warmup_bars) as well as on the
+//     close count, so a gap in the bars can never shorten the warmup.
 //
 // The bot reads one JSON line per minute (hello, then one batch per bar,
 // then done) and answers every batch with exactly one reply carrying its
 // orders. No network, no wall clock, no files, no randomness: the same
-// bars always produce the same orders.
-//
-// Entry (flat, at least 61 closes seen, no cooldown left): the latest close
-// sits 80 bps or more below the trailing 60-bar high, the trend is up
-// (close above the 48-bar EMA and the 12-bar EMA above the 48-bar EMA),
-// AND the 120-bar momentum is at least +100 bps (once 120 closes exist).
-// It buys with all available cash.
-// Exit (long): sell everything when the close rises 100 bps above the
-// entry (take profit), or falls 70 bps below the peak (trailing stop), or
-// falls 150 bps below the entry (hard stop). Then wait 5 bars before the
-// next entry, so a whipsaw cannot re-enter at once.
-// Position, cash and entry price always come from the account and the
-// fills of each batch, never from the bot's own memory of what it sent,
-// so a rejected order can never strand the bot in a phantom position.
-// Orders carry a 150 bps max slippage cap; a fill rejected for slippage
-// is simply retried on a later bar with a fresh client id.
+// bars always produce the same orders. Position, cash and entry price
+// always come from the account and the fills of each batch, never from
+// the bot's own memory of what it sent, so a rejected order can never
+// strand the bot in a phantom position.
 
 type Bar = {
   symbol: string;
@@ -66,6 +69,12 @@ type Position = {
   cost_quote_units: string;
 };
 
+type Account = {
+  cash_quote_units: string;
+  positions: Position[];
+  equity_quote_units: string;
+};
+
 const SYMBOL = "CBBTC";
 const FAST_LEN = 12;
 const SLOW_LEN = 48;
@@ -90,6 +99,7 @@ type State = {
   buyCount: number;
   sellCount: number;
   warmupBars: number;
+  batchSeq: number;
 };
 
 const state: State = {
@@ -102,30 +112,77 @@ const state: State = {
   buyCount: 0,
   sellCount: 0,
   warmupBars: 0,
+  batchSeq: 0,
 };
 
 function reply(seq: number, orders: unknown[]): void {
   process.stdout.write(JSON.stringify({ type: "reply", seq: seq, orders: orders }) + "\n");
 }
 
-function momentumBps(): number | null {
-  const closes = state.closes;
-  if (closes.length <= MOM_BARS) return null;
-  const now = closes[closes.length - 1];
-  const then = closes[closes.length - MOM_BARS - 1];
-  return ((now / then) - 1) * 10000;
+function validPrice(x: unknown): x is number {
+  return typeof x === "number" && Number.isFinite(x) && x > 0;
 }
 
-function trailingHigh(): number {
+function validAmount(x: unknown): x is number {
+  return typeof x === "number" && Number.isFinite(x) && x >= 0;
+}
+
+// 120-bar return in bps, from closes[N-121] to closes[N-1].
+// Returns null unless at least 121 valid closes exist and the return
+// itself is finite — the caller treats null as "do not trade".
+function momentumBps(): number | null {
+  const closes = state.closes;
+  if (closes.length < MOM_BARS + 1) return null;
+  const now = closes[closes.length - 1];
+  const then = closes[closes.length - MOM_BARS - 1];
+  if (!validPrice(now) || !validPrice(then)) return null;
+  const mom = (now / then - 1) * 10000;
+  return Number.isFinite(mom) ? mom : null;
+}
+
+// Highest close of exactly the 60 completed candles before the decision
+// candle: closes[N-61 .. N-2] once the decision close sits at N-1.
+// Null while fewer than 61 closes exist (no complete window yet).
+function trailingHigh(): number | null {
+  const closes = state.closes;
+  if (closes.length < LOOKBACK + 1) return null;
   let hi = 0;
-  for (let i = state.closes.length - LOOKBACK - 1; i < state.closes.length; i++) {
-    if (state.closes[i] > hi) hi = state.closes[i];
+  for (let i = closes.length - LOOKBACK - 1; i < closes.length - 1; i++) {
+    const v = closes[i];
+    if (validPrice(v) && v > hi) hi = v;
   }
-  return hi;
+  return hi > 0 ? hi : null;
+}
+
+function sellOrder(posQtyStr: string): unknown[] {
+  state.sellCount += 1;
+  state.cooldown = COOLDOWN_BARS;
+  return [{
+    side: "sell",
+    client_id: "s" + state.sellCount,
+    symbol: SYMBOL,
+    qty: posQtyStr,
+    max_slippage_bps: MAX_SLIPPAGE_BPS,
+  }];
+}
+
+function buyOrder(cash: number): unknown[] {
+  state.buyCount += 1;
+  return [{
+    side: "buy",
+    client_id: "b" + state.buyCount,
+    symbol: SYMBOL,
+    notional_quote_units: String(Math.floor(cash)),
+    max_slippage_bps: MAX_SLIPPAGE_BPS,
+  }];
 }
 
 function decide(bar: Bar, posQty: number, cash: number, posQtyStr: string): unknown[] {
   const close = Number(bar.c);
+  const high = Number(bar.h);
+  // Invalid close: skip the bar whole — no history, no EMA update,
+  // no decision. Incomplete data means NO TRADE.
+  if (!validPrice(close)) return [];
   state.closes.push(close);
   const af = 2 / (FAST_LEN + 1);
   const as = 2 / (SLOW_LEN + 1);
@@ -138,71 +195,74 @@ function decide(bar: Bar, posQty: number, cash: number, posQtyStr: string): unkn
   }
   if (state.cooldown > 0) state.cooldown -= 1;
 
+  // Holding: manage the exit. Peak tracks the highest HIGH since entry.
   if (posQty > 0) {
     if (state.entryPrice === 0) state.entryPrice = close;
-    const high = Number(bar.h);
-    if (high > state.peakPrice) state.peakPrice = high;
+    if (validPrice(high) && high > state.peakPrice) state.peakPrice = high;
     const take = close * 10000 >= state.entryPrice * (10000 + TAKE_BPS);
     const trail = close * 10000 <= state.peakPrice * (10000 - TRAIL_BPS);
     const stop = close * 10000 <= state.entryPrice * (10000 - STOP_BPS);
-    if (take || trail || stop) {
-      state.sellCount += 1;
-      state.cooldown = COOLDOWN_BARS;
-      return [{
-        side: "sell",
-        client_id: "s" + state.sellCount,
-        symbol: SYMBOL,
-        qty: posQtyStr,
-        max_slippage_bps: MAX_SLIPPAGE_BPS,
-      }];
-    }
+    if (take || trail || stop) return sellOrder(posQtyStr);
     return [];
   }
 
+  // Flat: clear any stale exit state, then check every entry gate.
   state.entryPrice = 0;
   state.peakPrice = 0;
   if (state.closes.length <= LOOKBACK) return [];
+  if (state.batchSeq < state.warmupBars) return [];
   if (state.closes.length <= state.warmupBars) return [];
   if (state.cooldown !== 0) return [];
   const hi = trailingHigh();
+  if (hi === null) return [];
   const dipped = close * 10000 <= hi * (10000 - DIP_BPS);
   const uptrend = close > state.emaSlow && state.emaFast > state.emaSlow;
+  // Fail-closed regime filter: momentum must be valid AND >= +100 bps.
+  // No bypass while history is insufficient.
   const mom = momentumBps();
-  const regimeOk = mom === null || mom >= MOM_MIN_BPS;
+  const regimeOk = mom !== null && Number.isFinite(mom) && mom >= MOM_MIN_BPS;
   if (dipped && uptrend && regimeOk && cash >= MIN_NOTIONAL) {
-    state.buyCount += 1;
-    return [{
-      side: "buy",
-      client_id: "b" + state.buyCount,
-      symbol: SYMBOL,
-      notional_quote_units: String(Math.floor(cash)),
-      max_slippage_bps: MAX_SLIPPAGE_BPS,
-    }];
+    return buyOrder(cash);
   }
   return [];
 }
 
 function handleBatch(msg: any): void {
-  const bars: Bar[] = msg.bars || [];
-  const bar = bars.find((b) => b.symbol === SYMBOL);
-  const fills: Fill[] = msg.fills || [];
-  const account = msg.account || { cash_quote_units: "0", positions: [], equity_quote_units: "0" };
+  const seq = typeof msg.seq === "number" ? msg.seq : state.batchSeq;
+  state.batchSeq = seq;
+  const bars: Bar[] = Array.isArray(msg.bars) ? msg.bars : [];
+  const bar = bars.find((b) => b && b.symbol === SYMBOL);
+  const fills: Fill[] = Array.isArray(msg.fills) ? msg.fills : [];
+  const account: Account = msg.account && typeof msg.account === "object"
+    ? msg.account
+    : { cash_quote_units: "0", positions: [], equity_quote_units: "0" };
 
+  // Fills first: they set the entry price of a position we now hold.
   for (const f of fills) {
-    if (f.status === "filled" && f.symbol === SYMBOL) {
-      if (f.side === "buy") state.entryPrice = Number(f.price);
-      if (f.side === "sell") {
-        state.entryPrice = 0;
-        state.peakPrice = 0;
-      }
+    if (!f || f.symbol !== SYMBOL) continue;
+    if (f.status === "filled" && f.side === "buy") {
+      const px = Number(f.price);
+      if (validPrice(px)) state.entryPrice = px;
+    } else if (f.status === "filled" && f.side === "sell") {
+      state.entryPrice = 0;
+      state.peakPrice = 0;
     }
+    // Rejected fills need no action: cash/position never moved, the
+    // next batch retries with a fresh client id if the setup persists.
   }
 
-  const pos = (account.positions || []).find((p: Position) => p.symbol === SYMBOL);
-  const qty = pos ? Number(pos.qty) : 0;
-  const cash = Number(account.cash_quote_units || "0");
-  const orders: unknown[] = bar ? decide(bar, qty, cash, pos ? pos.qty : "0") : [];
-  reply(msg.seq, orders);
+  const positions = Array.isArray(account.positions) ? account.positions : [];
+  const pos = positions.find((p) => p && p.symbol === SYMBOL);
+  const rawQty = pos ? Number(pos.qty) : 0;
+  const qty = validAmount(rawQty) ? rawQty : 0;
+  const rawCash = Number(account.cash_quote_units || "0");
+  const cash = validAmount(rawCash) ? rawCash : 0;
+  // No CBBTC bar in this batch: still exactly one reply, empty orders.
+  // The sell order carries String(qty) — the validated numeric quantity —
+  // never the raw position string, so a malformed qty can never be echoed
+  // back into an order.
+  const orders: unknown[] = bar ? decide(bar, qty, cash, String(qty)) : [];
+  reply(seq, orders);
 }
 
 function handleLine(line: string): void {
@@ -212,8 +272,10 @@ function handleLine(line: string): void {
   } catch {
     return;
   }
+  if (!msg || typeof msg !== "object") return;
   if (msg.type === "hello") {
-    if (typeof msg.warmup_bars === "number") state.warmupBars = msg.warmup_bars;
+    const w = msg.warmup_bars;
+    state.warmupBars = typeof w === "number" && Number.isSafeInteger(w) && w >= 0 ? w : 0;
     return;
   }
   if (msg.type === "batch") {
